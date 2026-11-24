@@ -1,0 +1,233 @@
+
+# JIHAD AI - 5 MINUTE SIGNAL BOT
+# Signal only - no real trade execution
+
+import yfinance as yf
+import pandas as pd
+import time
+
+PAIRS = {
+    "EUR/USD": "EURUSD=X",
+    "GBP/USD": "GBPUSD=X",
+    "XAU/USD GOLD": "XAUUSD=X"
+}
+
+TIMEFRAME = "5m"
+CHECK_EVERY_SECONDS = 60
+
+def get_data(symbol):
+    df = yf.download(
+        symbol,
+        period="5d",
+        interval=TIMEFRAME,
+        progress=False,
+        auto_adjust=False
+    )
+
+    if df.empty:
+        return None
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
+    return df.dropna()
+
+def analyze(name, symbol):
+    df = get_data(symbol)
+
+    if df is None or len(df) < 60:
+        print(f"{name}: ডেটা পাওয়া যাচ্ছে না")
+        return
+
+    # শুধুমাত্র সম্পূর্ণ বন্ধ ৫ মিনিটের ক্যান্ডেল ব্যবহার
+    idx = df.index
+    now = pd.Timestamp.now(tz=idx.tz) if idx.tz else pd.Timestamp.now()
+    current_bucket = now.floor("5min")
+    closed = df.loc[idx < current_bucket]
+
+    if len(closed) < 50:
+        print(f"{name}: পর্যাপ্ত ডেটা নেই")
+        return
+
+    c = closed["Close"].astype(float)
+    h = closed["High"].astype(float)
+    l = closed["Low"].astype(float)
+
+    # EMA
+    ema9 = c.ewm(span=9, adjust=False).mean()
+    ema21 = c.ewm(span=21, adjust=False).mean()
+
+    # RSI
+    delta = c.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1/14, min_periods=14).mean()
+    avg_loss = loss.ewm(alpha=1/14, min_periods=14).mean()
+
+    rs = avg_gain / avg_loss.replace(0, 1e-10)
+    rsi = 100 - (100 / (1 + rs))
+
+    # MACD
+    macd = c.ewm(span=12, adjust=False).mean() - \
+           c.ewm(span=26, adjust=False).mean()
+    macd_signal = macd.ewm(span=9, adjust=False).mean()
+
+    # ADX (trend strength)
+    up_move = h.diff()
+    down_move = -l.diff()
+
+    plus_dm = up_move.where(
+        (up_move > down_move) & (up_move > 0), 0
+    )
+    minus_dm = down_move.where(
+        (down_move > up_move) & (down_move > 0), 0
+    )
+
+    tr = pd.concat([
+        h - l,
+        (h - c.shift()).abs(),
+        (l - c.shift()).abs()
+    ], axis=1).max(axis=1)
+
+    atr = tr.ewm(alpha=1/14, min_periods=14).mean()
+
+    plus_di = 100 * plus_dm.ewm(
+        alpha=1/14, min_periods=14
+    ).mean() / atr
+
+    minus_di = 100 * minus_dm.ewm(
+        alpha=1/14, min_periods=14
+    ).mean() / atr
+
+    dx = 100 * (plus_di - minus_di).abs() / \
+         (plus_di + minus_di).replace(0, 1e-10)
+
+    adx = dx.ewm(alpha=1/14, min_periods=14).mean()
+
+    # Latest closed candle values
+    price = c.iloc[-1]
+    e9 = ema9.iloc[-1]
+    e21 = ema21.iloc[-1]
+    r = rsi.iloc[-1]
+    m = macd.iloc[-1]
+    ms = macd_signal.iloc[-1]
+    a = adx.iloc[-1]
+    pdi = plus_di.iloc[-1]
+    mdi = minus_di.iloc[-1]
+
+    buy = 0
+    sell = 0
+    reasons = []
+
+    # 1. EMA trend
+    if e9 > e21:
+        buy += 1
+        reasons.append("EMA UP")
+    elif e9 < e21:
+        sell += 1
+        reasons.append("EMA DOWN")
+
+    # 2. RSI momentum
+    if 52 <= r <= 68:
+        buy += 1
+        reasons.append("RSI bullish")
+    elif 32 <= r <= 48:
+        sell += 1
+        reasons.append("RSI bearish")
+
+    # 3. MACD momentum
+    if m > ms:
+        buy += 1
+        reasons.append("MACD UP")
+    elif m < ms:
+        sell += 1
+        reasons.append("MACD DOWN")
+
+    # 4. Last candle momentum
+    if c.iloc[-1] > c.iloc[-2]:
+        buy += 1
+        reasons.append("Candle UP")
+    elif c.iloc[-1] < c.iloc[-2]:
+        sell += 1
+        reasons.append("Candle DOWN")
+
+    # 5. ADX trend direction (only if trend is strong)
+    if a >= 20:
+        if pdi > mdi:
+            buy += 1
+            reasons.append("ADX bullish trend")
+        elif mdi > pdi:
+            sell += 1
+            reasons.append("ADX bearish trend")
+
+    print("\n" + "=" * 40)
+    print("PAIR:", name)
+    print("CANDLE:", closed.index[-1])
+    print("PRICE:", round(price, 5))
+    print("RSI:", round(r, 2))
+    print("ADX:", round(a, 2))
+    print("BUY SCORE:", buy, "/ 5")
+    print("SELL SCORE:", sell, "/ 5")
+
+    # Signal threshold: 4 of 5 conditions
+    if buy >= 4 and buy > sell:
+        print("SIGNAL: 🟢 UP")
+        print("STRENGTH:", int(buy / 5 * 100), "%")
+
+    elif sell >= 4 and sell > buy:
+        print("SIGNAL: 🔴 DOWN")
+        print("STRENGTH:", int(sell / 5 * 100), "%")
+
+    else:
+        print("SIGNAL: ⚪ WAIT")
+        print("Strong agreement not found.")
+
+    print("REASONS:", ", ".join(reasons))
+    print("EXPIRY IDEA: 5 minutes")
+    print("=" * 40)
+
+def main():
+    print("JIHAD AI - 5 MIN SIGNAL BOT")
+    print("Starting analysis...")
+
+    last_candle = {}
+
+    while True:
+        try:
+            for name, symbol in PAIRS.items():
+                df = get_data(symbol)
+
+                if df is None or len(df) < 60:
+                    print(name, "- No data")
+                    continue
+
+                idx = df.index
+                now = pd.Timestamp.now(tz=idx.tz) if idx.tz else pd.Timestamp.now()
+                bucket = now.floor("5min")
+                closed = df.loc[idx < bucket]
+
+                if len(closed) < 50:
+                    continue
+
+                candle_time = str(closed.index[-1])
+
+                # একই candle-এ duplicate signal আটকায়
+                if last_candle.get(name) == candle_time:
+                    continue
+
+                last_candle[name] = candle_time
+                analyze(name, symbol)
+
+            time.sleep(CHECK_EVERY_SECONDS)
+
+        except KeyboardInterrupt:
+            print("\nBot stopped.")
+            break
+
+        except Exception as error:
+            print("Error:", error)
+            time.sleep(30)
+
+if __name__ == "__main__":
+    main()
